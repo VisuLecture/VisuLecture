@@ -46,6 +46,45 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
+// Authentification HTTP Basic globale (pages, API, WebSocket Blazor).
+// Identifiants lus dans les variables d'environnement VISULECTURE_USER / VISULECTURE_PASSWORD.
+// Si le mot de passe est absent hors développement, l'application refuse de démarrer (échec fermé).
+var authUser = Environment.GetEnvironmentVariable("VISULECTURE_USER") ?? "visulecture";
+var authPassword = Environment.GetEnvironmentVariable("VISULECTURE_PASSWORD");
+if (string.IsNullOrEmpty(authPassword) && !app.Environment.IsDevelopment())
+{
+    throw new InvalidOperationException("VISULECTURE_PASSWORD doit être défini.");
+}
+
+if (!string.IsNullOrEmpty(authPassword))
+{
+    var expected = System.Security.Cryptography.SHA256.HashData(
+        System.Text.Encoding.UTF8.GetBytes(authUser + ":" + authPassword));
+
+    app.Use(async (context, next) =>
+    {
+        var header = context.Request.Headers.Authorization.ToString();
+        if (header.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(header[6..].Trim()));
+                var provided = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(decoded));
+                if (System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(provided, expected))
+                {
+                    await next();
+                    return;
+                }
+            }
+            catch (FormatException) { }
+        }
+
+        await Task.Delay(1000); // ralentit les tentatives de force brute
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        context.Response.Headers.WWWAuthenticate = "Basic realm=\"VisuLecture\", charset=\"UTF-8\"";
+    });
+}
+
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
 {
