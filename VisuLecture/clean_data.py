@@ -1,506 +1,129 @@
-import argparse
-import copy
-import csv
-import math
+"""clean_data.py (v2) — même interface CLI que la v1.
 
-import cv2
-import numpy as np
-import pandas as pd
-from scipy.signal import savgol_filter
+Pipeline de nettoyage v2 : recalage robuste + segmentation en lignes par Viterbi
+(progression monotone, début ligne 0, fin dernière ligne) + recalage horizontal par ligne."""
+import numpy as np, pandas as pd
+from scipy.signal import savgol_filter, medfilt
 
-class Point:
-    def __init__(self, timestamp, x, y, jump=False, saccade=False):
-        self.timestamp = timestamp
-        self.x = x
-        self.y = y
-        self.jump = jump
-        self.saccade = saccade
+def _line_geometry(words):
+    g = words.groupby("ligne")
+    ys = (g.y.mean() + g.hauteur.mean() / 2).round().to_numpy()   # centre des lignes
+    xl = g.x.min().to_numpy().astype(float); xr = (words.x + words.largeur).groupby(words.ligne).max().to_numpy().astype(float)
+    return ys, xl, xr
 
-def loadPoints(path=None):
-    points = []
-    with open(f"{path}", "r") as f:
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            points.append(Point(float(row[0]), int(row[1]), int(row[2]), False))
-    return points
+def _register(x, y, ys, xl, xr):
+    """Mise à l'échelle robuste (percentiles) du nuage de regard sur la boîte de texte."""
+    out = []
+    for v, lo_t, hi_t in ((x, xl.min(), xr.max()), (y, ys.min(), ys.max())):
+        lo, hi = np.percentile(v, [3, 97])
+        s = (hi_t - lo_t) / max(hi - lo, 1e-6)
+        out.append(lo_t + (v - lo) * s)
+    return out
 
-def loadWords(path=None):
-    print("path = ", path)
-    return pd.read_csv(f"{path}")
+ADV=30.0; BAD=20.0; EM=2
+def _viterbi_lines(x, y, ys, xr_total, sigma, adv_cost=None, reset_bonus=None, bad_cost=None, x_only=False):
+    adv_cost = ADV if adv_cost is None else adv_cost; reset_bonus = adv_cost if reset_bonus is None else reset_bonus; bad_cost = BAD if bad_cost is None else bad_cost
+    T, L = len(y), len(ys)
+    d = (y[:, None] - ys[None, :]) / sigma
+    emit = np.log1p(d * d)                                         # coût robuste (Cauchy)
+    W = 8
+    mp_ = np.array([np.median(x[max(0, t - W):t]) if t > 0 else x[0] for t in range(T)])
+    mn_ = np.array([np.median(x[t:t + W]) for t in range(T)])
+    reset = np.clip(((mp_ - mn_) - 0.25 * xr_total) / (0.35 * xr_total), 0, 1)
+    if x_only: emit = emit * 0
+    return _segment_dp(emit, reset, adv_cost, reset_bonus)
 
-def _find_reading_start_index(points, max_skip=40, window_size=10, min_horizontal_ratio=1.5):
-    n = len(points)
-    if n <= window_size:
-        return 0
-    last_start = min(max_skip, n - window_size)
-    start_idx = 0
-    for start in range(last_start + 1):
-        p1, p2 = points[start], points[start + window_size - 1]
-        dx, dy = p2.x - p1.x, p2.y - p1.y
-        if dx > 0 and abs(dx) >= abs(dy) * min_horizontal_ratio:
-            start_idx = start
-            break
-    return start_idx
+MINLEN = 15
+def _segment_dp(emit, reset, adv_cost, reset_bonus):
+    """Segmentation exacte en L segments consécutifs (ligne 0 -> L-1), durée min MINLEN images."""
+    T, L = emit.shape
+    ml = min(MINLEN, max(2, T // (2 * L)))
+    cum = np.vstack([np.zeros((1, L)), np.cumsum(emit, 0)])            # cum[t, l] = somme emit[:t, l]
+    trans = np.maximum(adv_cost - reset_bonus * reset, 0.5)           # coût d'un début de ligne en s
+    INF = 1e18
+    best = np.full((L, T + 1), INF); arg = np.zeros((L, T + 1), int)
+    best[0, ml:] = cum[ml:, 0]
+    for l in range(1, L):
+        base = np.full(T + 1, INF)
+        base[:T] = best[l - 1, :T] + trans - cum[:T, l]               # best[l-1][s] + trans[s] - cum[s, l]
+        run_min = np.minimum.accumulate(base); run_arg = np.zeros(T + 1, int)
+        # argmin courant
+        idx = np.arange(T + 1); is_new = base == run_min
+        run_arg = np.maximum.accumulate(np.where(is_new, idx, 0))
+        for t in range(ml * (l + 1), T + 1):
+            sidx = t - ml
+            best[l, t] = run_min[sidx] + cum[t, l]; arg[l, t] = run_arg[sidx]
+    path = np.zeros(T, int); t = T
+    for l in range(L - 1, -1, -1):
+        s = arg[l, t] if l > 0 else 0
+        path[s:t] = l; t = s
+    return path
 
-def _order_box(box):
-    box = np.array(box, dtype=np.float32)
-    s = box.sum(axis=1)
-    d = np.diff(box, axis=1).ravel()
-    tl = box[np.argmin(s)]
-    br = box[np.argmax(s)]
-    tr = box[np.argmin(d)]
-    bl = box[np.argmax(d)]
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+def process(points, words, sg=True):
+    """points: DataFrame timestamp,x,y. Retourne DataFrame timestamp,x,y,line,jump,saccade."""
+    ys, xl, xr = _line_geometry(words)
+    t = points.timestamp.to_numpy(); x = points.x.to_numpy(float); y = points.y.to_numpy(float)
+    x = medfilt(x, 5); y = medfilt(y, 5)
+    xg, yg = _register(x, y, ys, xl, xr)
+    spacing = np.median(np.diff(ys)) if len(ys) > 1 else 100
+    sigma = 0.9 * spacing
+    path = _viterbi_lines(xg, yg, ys, xr.max() - xl.min(), sigma=sigma, x_only=True)   # init : retours à la ligne en x seulement
+    tgt = ys[path]; a, b = np.polyfit(yg, tgt, 1) if False else (1.0, 0.0)
+    meds = np.array([np.median(yg[path == l]) if (path == l).any() else np.nan for l in range(len(ys))])
+    ok = ~np.isnan(meds)
+    if ok.sum() >= 3:
+        a, b = np.polyfit(meds[ok], ys[ok], 1); a = float(np.clip(a, 0.7, 1.4)); b = float(np.mean(ys[ok] - a * meds[ok])); yg = a * yg + b
+    for it in range(EM):                                             # EM : lignes <-> recalage vertical affine robuste
+        path = _viterbi_lines(xg, yg, ys, xr.max() - xl.min(), sigma=sigma)
+        tgt = ys[path]
+        w = np.abs(yg - tgt) < 1.5 * spacing
+        if w.sum() < 20: break
+        a, b = np.polyfit(yg[w], tgt[w], 1)
+        a = float(np.clip(a, 0.7, 1.4)); b = float(np.mean(tgt[w] - a * yg[w]))
+        yg = a * yg + b
+    xo = np.clip(xg, xl.min(), xr.max())
+    # recalage horizontal par ligne (si la ligne est suffisamment balayée)
+    for l in range(len(ys)):
+        idx = np.where(path == l)[0]
+        if len(idx) < 15: continue
+        lo, hi = np.percentile(xg[idx], [4, 96])
+        if hi - lo > 0.5 * (xr[l] - xl[l]):
+            xo[idx] = xl[l] + (xg[idx] - lo) * (xr[l] - xl[l]) / (hi - lo)
+    xo = np.clip(xo, xl.min(), xr.max())
+    jump = np.zeros(len(t), bool)
+    for b in np.where(np.diff(path) > 0)[0] + 1:
+        a = max(0, b - 5) + int(np.argmax(xo[max(0, b - 5):b])); c = b + int(np.argmin(xo[b:b + 5]))
+        jump[a + 1:c] = True; jump[b] = True
+    xs = xo.copy()
+    if sg:                                                          # lissage unique, par segment de ligne
+        for l in range(len(ys)):
+            idx = np.where((path == l) & ~jump)[0]
+            if len(idx) >= 9: xs[idx] = savgol_filter(xo[idx], 9, 2)
+    step = np.abs(np.diff(xo, prepend=xo[0]))
+    sacc = ((step > 0.12 * (xr.max() - xl.min())) & ~jump).astype(int)   # grands déplacements hors retour à la ligne
+    return pd.DataFrame(dict(timestamp=t, x=np.rint(xo).astype(int), xs=np.rint(xs).astype(int),
+                             y=np.rint(ys[path]).astype(int), yr=np.rint(ys[path] + np.clip(yg - ys[path], -0.5 * spacing, 0.5 * spacing)).astype(int),
+                             line=path + 1, jump=jump.astype(int), saccade=sacc))
 
-def _recalibrate_points(points, words):
-    start_idx = _find_reading_start_index(points)
-    pts_reading = np.array([(p.x, p.y) for p in points[start_idx:]], dtype=np.float32)
-    rect_reading = cv2.minAreaRect(pts_reading)
-    box_reading = cv2.boxPoints(rect_reading)
-
-    pts_words = []
-    for _, w in words.iterrows():
-        x, y = w["x"], w["y"]
-        w_, h_ = w["largeur"], w["hauteur"]
-        pts_words.extend([(x, y), (x + w_, y), (x + w_, y + h_), (x, y + h_)])
-
-    pts_words = np.array(pts_words, dtype=np.float32)
-    rect_words = cv2.minAreaRect(pts_words)
-    box_words = cv2.boxPoints(rect_words)
-
-    src = _order_box(box_reading)
-    dst = _order_box(box_words)
-    H = cv2.getPerspectiveTransform(src, dst)
-
-    pts_all = np.array([(p.x, p.y) for p in points], dtype=np.float32).reshape(-1, 1, 2)
-    pts_corrected_all = cv2.perspectiveTransform(pts_all, H).reshape(-1, 2)
-
-    corrected = []
-    for p, (x_new, y_new) in zip(points, pts_corrected_all):
-        corrected.append(
-            Point(
-                timestamp=p.timestamp,
-                x=int(round(x_new)),
-                y=int(round(y_new)),
-                jump=p.jump,
-                saccade=getattr(p, 'saccade', False)
-            )
-        )
-    return corrected
-
-def cleanData(csvPointsPath=None, csvWordsPath=None):
-    points = loadPoints(csvPointsPath)
-    words = loadWords(csvWordsPath)
-    return _recalibrate_points(points, words)
-
-def write_points(points, out_path):
-    with open(out_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "x", "y", "jump", "saccade"])
-        for p in points:
-            writer.writerow([p.timestamp, p.x, p.y, int(p.jump), int(getattr(p, 'saccade', False))])
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--points", help="csv points path", default=None)
-    parser.add_argument("--words", help="csv words path", default=None)
-    parser.add_argument("--cleaned", help="output csv path", default="points_cleaned.csv")
-    parser.add_argument("--normalized", help="output csv path", default="points_normalized.csv")
-    parser.add_argument("--smoothedBoth", help="output csv path", default="points_smoothBoth.csv")
-    parser.add_argument("--smoothedY", help="output csv path", default="points_smoothY.csv")
-    args = parser.parse_args()
-
-    corrected = cleanData(args.points, args.words)  # recalibrage homographie
-    words = loadWords(args.words)                   # DataFrame OCR
-    line_ys = getLinesList(words)                   # hauteurs de lignes
-
-    corrected = getJumps(corrected, 1920, 1080, nbLines=len(line_ys), lines=line_ys)
-
-    write_points(corrected, args.cleaned)
-    
-    normalized = normalize_points_to_lines(corrected, line_ys)
-    write_points(normalized, args.normalized)
-
-    smoothedBoth = corrected.copy()
-    
-    for i in range(100):
-        smoothedBoth = apply_savitzky_golay(smoothedBoth, window_length=11, polyorder=3, axis='both', include_jumps=False)
-    write_points(smoothedBoth, args.smoothedBoth)
-
-    smoothedY = corrected.copy()
-    for i in range(100):
-        smoothedY = apply_savitzky_golay(smoothedY, window_length=11, polyorder=3, axis='y', include_jumps=False)
-    write_points(smoothedY, args.smoothedY)
-
-def getLinesList(words_df):
-    return list(words_df.groupby("ligne")["y"].mean().round().astype(int).reset_index()["y"])
-
-def normalize_points_to_lines(points, line_ys):
-    if not points:
-        return points
-
-    if isinstance(line_ys, pd.DataFrame):
-        line_ys = getLinesList(line_ys)
-    line_ys = list(line_ys)
-    if not line_ys:
-        return points
-
-    jump = False
-    ligne = 0
-    normalized = []
-
-    for p in points:
-        if p.jump:
-            jump = True
-            continue
-
-        if jump and not p.jump:
-            ligne += 1
-            jump = False
-        y = line_ys[min(ligne, len(line_ys)-1)]
-        normalized.append(Point(p.timestamp, p.x, y, p.jump, getattr(p, 'saccade', False)))
-
-    return normalized
-
-def isJumpNew(
-        currentPoint, nextPoints, coeffCalibration, nbLines,
-        averageReadingSpeed, height_coef, width_coef,
-        fps=30, width=1920, height=1080
-):
-    if len(nextPoints) > 1 and average_speed([currentPoint, nextPoints[1]]) < 1000:
-        return False, 0
-
-    ##TODO: adapation ici ?     
-    authorized_interval_coeff = 1
-
-    for interval_size in range(int(fps / 4), int(fps / 1.5)):
-        interval_points = nextPoints[:interval_size]
-        if not interval_points:
-            continue
-
-        min_x = float("inf")
-        index = 0
-        gi = 0
-
-        for p in interval_points:
-            gi += 1
-            if p.x < min_x:
-                min_x = p.x
-                index = gi
-
-        end_point = len(interval_points)
-        for j, point in enumerate(interval_points):
-            if point.x > min_x + 5 and j > index:
-                end_point = j
-                break
-        interval_points = interval_points[:end_point]
-
-        if len(interval_points) <= 2:
-            continue
-
-        first_point = interval_points[0]
-        last_point = interval_points[-1]
-        avg_speed = average_speed(interval_points)
-
-        if avg_speed < 1000:
-            continue
-        if last_point.x >= 0.5 * width:
-            continue
-
-        if (
-                last_point.x + int(500 * authorized_interval_coeff * width_coef) < first_point.x and
-                last_point.y > first_point.y + int(65 * authorized_interval_coeff * height_coef)
-        ):
-            speeds = compute_speeds(interval_points)
-            accels = compute_accelerations(speeds)
-            if accels and abs(max(accels) - min(accels)) < averageReadingSpeed * 2:
-                return True, interval_size
-
-    return False, 0
-
-def compute_speeds(pts):
-    return [((pts[i].x - pts[i - 1].x)**2 + (pts[i].y - pts[i - 1].y)**2)**0.5 for i in range(1, len(pts))]
-
-def compute_accelerations(sp):
-    return [sp[i] - sp[i - 1] for i in range(1, len(sp))]
-
-def detectJumps(points, width, height, average_speed, width_coeff=1, height_coeff=1):
-    result = []
-    jump_segments = []
-
-    if len(points) == 1:
-        p = points[0]
-        result.append(Point(p.timestamp, p.x, p.y, False, getattr(p, 'saccade', False)))
-        return result, jump_segments
-
-    n = len(points)
-    i = 0
-
-    while i < n - 1:
-        jump, skip = isJumpNew(
-            points[i], points[i + 1:], None, None, average_speed, height_coef=height_coeff, width_coef=width_coeff
-        )
-
-        result.append(Point(points[i].timestamp, points[i].x, points[i].y, False, getattr(points[i], 'saccade', False)))
-
-        if not jump:
-            i += 1
-            continue
-
-        minSkipped = skip
-        maxIndex = i + 1
-
-        for index in range(i + 1, i + 1 + skip):
-            if index >= len(points):
-                break
-
-            jumped, nbSkipped = isJumpNew(
-                points[index], points[index:], None, None, average_speed,
-                height_coef=height_coeff, width_coef=width_coeff
-            )
-            if jumped and nbSkipped < minSkipped:
-                minSkipped = nbSkipped
-                maxIndex = index
-
-        start_idx = maxIndex
-        end_idx = min(maxIndex + minSkipped - 1, n - 1)
-        jump_segments.append({"start_index": start_idx, "end_index": end_idx})
-
-        for j in range(i + 1, maxIndex):
-            if j >= n:
-                break
-            p = points[j]
-            result.append(Point(p.timestamp, p.x, p.y, False, getattr(p, 'saccade', False)))
-
-        for j in range(maxIndex, maxIndex + minSkipped):
-            if j >= n:
-                break
-            p = points[j]
-            result.append(Point(p.timestamp, p.x, p.y, True, getattr(p, 'saccade', False)))
-
-        i = maxIndex + minSkipped
-
-    if n > 0:
-        last = points[-1]
-        result.append(Point(last.timestamp, last.x, last.y, False, getattr(last, 'saccade', False)))
-
-    return result, jump_segments
-
-def getJumps(points, width, height, nbLines, lines, max_iterations=15, fps=30):
-    returned_points = []
-    avg_reading_speed = average_speed(points)
-
-    adjustedPoints = copy.deepcopy(points)
-    width_coeff = 1
-    height_coeff = 1
-
-    optimal_number_points_jump = int(fps / 4)
-    best_score_optimal_jumps = float("inf")
-    index_array_readjusted_jumps = [None] * max_iterations
-    array_non_optimal_difference = [None] * max_iterations
-
-    for iteration in range(max_iterations):
-        nb_non_optimal_jumps = 0
-        optimal = True
-
-        points, jumps = detectJumps(
-            adjustedPoints, width, height,
-            avg_reading_speed, width_coeff, height_coeff
-        )
-
-        if len(jumps) > nbLines - 1:
-            height_coeff *= 1.15
-        elif len(jumps) < nbLines - 1:
-            height_coeff *= 0.85
-        else:
-            for jump in jumps:
-                jump_length = jump["end_index"] - jump["start_index"] + 1
-
-                if jump_length > optimal_number_points_jump + 1:
-                    optimal = False
-
-                if jump_length < int(fps / 1.5):
-                    start_point = points[jump["start_index"]]
-                    before_point = points[jump["start_index"] - 1]
-
-                    if before_point.x - start_point.x > 750 * width_coeff:
-                        jump["start_index"] -= 1
-                        before_point.jump = True
-                        index_array_readjusted_jumps[iteration] = jump["start_index"]
-
-                        if iteration == 0 or index_array_readjusted_jumps[iteration] == index_array_readjusted_jumps[iteration - 1]:
-                            optimal = False
-
-                nb_non_optimal_jumps += max(0, jump_length - optimal_number_points_jump)
-
-            array_non_optimal_difference[iteration] = nb_non_optimal_jumps
-
-            if best_score_optimal_jumps > nb_non_optimal_jumps:
-                best_score_optimal_jumps = nb_non_optimal_jumps
-
-            returned_points = points
-
-            if optimal:
-                break
-
-        if iteration == 0:
-            returned_points = points
-
-    # Détecter et appliquer les saccades
-    detectSaccades(returned_points)
-
-    return returned_points
-
-def detectSaccades(points):
-    max_speed = 900
-    max_accel = 250
-    groups = []
-
-    i = 0
-    while i + 3 < len(points):
-        g = [points[i], points[i + 1], points[i + 2], points[i + 3]]
-
-        if g[0].jump or g[1].jump or g[2].jump or g[3].jump:
-            i += 4
-            continue
-
-        groups.append(g)
-        i += 4
-
-    outliers = []
-    for g in groups:
-        speeds = compute_speeds(g)            # vitesses
-        accels = compute_accelerations(speeds)  # accélérations
-        if max(speeds) > max_speed or max(accels) > max_accel:
-            g[0].saccade = True
-            g[1].saccade = True
-            g[2].saccade = True
-            g[3].saccade = True
-            outliers.append(g)
-
-    return outliers
-
-def average_speed(nextPoints, fps=30):
-    if len(nextPoints) < 2:
-        return 0.0
-
-    distances = []
-    for i in range(len(nextPoints) - 1):
-        p1 = nextPoints[i]
-        p2 = nextPoints[i + 1]
-        dist = math.hypot(p2.x - p1.x, p2.y - p1.y)
-        distances.append(dist)
-
-    mean_dist_per_frame = sum(distances) / len(distances)
-    mean_speed_per_second = mean_dist_per_frame * fps
-    return mean_speed_per_second
-
-
-def apply_savitzky_golay(points, window_length=11, polyorder=3, axis='both', include_jumps=False):
-    """
-    Applique le filtre Savitzky-Golay aux coordonnées des points.
-    
-    Args:
-        points: Liste de Point à traiter
-        window_length: Longueur de la fenêtre de filtrage (doit être impair)
-        polyorder: Ordre du polynôme pour le lissage
-        axis: 'x', 'y' ou 'both' - détermine quelles coordonnées lisser
-        include_jumps: Si False, ne lisse pas les points marqués comme sauts
-        
-    Returns:
-        Liste de Point avec coordonnées lissées
-    """
-    if not points or len(points) < window_length:
-        return points
-    
-    # Ajuster window_length si nécessaire (doit être impair et <= len(points))
-    if window_length % 2 == 0:
-        window_length += 1
-    window_length = min(window_length, len(points))
-    if window_length < polyorder + 2:
-        window_length = polyorder + 2
-        if window_length % 2 == 0:
-            window_length += 1
-    
-    # Extraire les coordonnées
-    x_coords = [p.x for p in points]
-    y_coords = [p.y for p in points]
-    
-    # Appliquer le filtre selon l'axe choisi
-    if axis in ['x', 'both']:
-        if include_jumps:
-            x_smoothed = savgol_filter(x_coords, window_length, polyorder)
-        else:
-            # Lisser seulement les segments sans sauts
-            x_smoothed = list(x_coords)  # Copie
-            segments = []
-            current_segment = []
-            
-            for i, p in enumerate(points):
-                if not p.jump:
-                    current_segment.append(i)
-                else:
-                    if len(current_segment) >= window_length:
-                        segments.append(current_segment)
-                    current_segment = []
-            
-            if len(current_segment) >= window_length:
-                segments.append(current_segment)
-            
-            # Appliquer le filtre sur chaque segment
-            for segment in segments:
-                segment_x = [x_coords[i] for i in segment]
-                segment_smoothed = savgol_filter(segment_x, window_length, polyorder)
-                for i, idx in enumerate(segment):
-                    x_smoothed[idx] = segment_smoothed[i]
-    else:
-        x_smoothed = x_coords
-    
-    if axis in ['y', 'both']:
-        if include_jumps:
-            y_smoothed = savgol_filter(y_coords, window_length, polyorder)
-        else:
-            # Lisser seulement les segments sans sauts
-            y_smoothed = list(y_coords)  # Copie
-            segments = []
-            current_segment = []
-            
-            for i, p in enumerate(points):
-                if not p.jump:
-                    current_segment.append(i)
-                else:
-                    if len(current_segment) >= window_length:
-                        segments.append(current_segment)
-                    current_segment = []
-            
-            if len(current_segment) >= window_length:
-                segments.append(current_segment)
-            
-            # Appliquer le filtre sur chaque segment
-            for segment in segments:
-                segment_y = [y_coords[i] for i in segment]
-                segment_smoothed = savgol_filter(segment_y, window_length, polyorder)
-                for i, idx in enumerate(segment):
-                    y_smoothed[idx] = segment_smoothed[i]
-    else:
-        y_smoothed = y_coords
-    
-    # Créer la liste de points lissés
-    smoothed_points = []
-    for i, p in enumerate(points):
-        smoothed_points.append(
-            Point(
-                timestamp=p.timestamp,
-                x=int(round(x_smoothed[i])),
-                y=int(round(y_smoothed[i])),
-                jump=p.jump,
-                saccade=getattr(p, 'saccade', False)
-            )
-        )
-    
-    return smoothed_points
-
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--points"); ap.add_argument("--words")
+    ap.add_argument("--cleaned", default="points_cleaned.csv"); ap.add_argument("--normalized", default="points_normalized.csv")
+    ap.add_argument("--smoothedBoth", default="points_smoothBoth.csv"); ap.add_argument("--smoothedY", default="points_smoothY.csv")
+    a = ap.parse_args()
+    pts = pd.read_csv(a.points); words = pd.read_csv(a.words, encoding="utf-8-sig")
+    nl = words["ligne"].nunique()
+    if len(pts) < 2 * nl:
+        raise SystemExit(f"Trop peu de points ({len(pts)}) pour {nl} lignes de texte")
+    o = process(pts, words)
+    cols = ["timestamp", "x", "y", "jump", "saccade"]
+    o.assign(y=o["yr"])[cols].to_csv(a.cleaned, index=False)                            # recalé, y continu
+    o[o.jump == 0][cols].to_csv(a.normalized, index=False)                           # y calé sur la ligne, retours retirés
+    o.assign(x=o["xs"])[cols].to_csv(a.smoothedBoth, index=False)                       # x lissé, y calé sur la ligne
+    o[cols].to_csv(a.smoothedY, index=False)                                         # x recalé, y calé sur la ligne
+    print(f"{len(o)} points, {nl} lignes, {int(o.jump.sum())} points de retour à la ligne")
 
 if __name__ == "__main__":
     main()
